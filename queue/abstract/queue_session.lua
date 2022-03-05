@@ -4,6 +4,8 @@ local uuid     = require('uuid')
 
 local util     = require('queue.util')
 local qc       = require('queue.compat')
+local queue_state = require('queue.abstract.queue_state')
+
 local num_type = qc.num_type
 local str_type = qc.str_type
 
@@ -53,6 +55,10 @@ local function identification_init()
 end
 
 local function cleanup_inactive_sessions()
+    if queue_state.get() ~= queue_state.states.RUNNING then
+        return
+    end
+
     local queue_inactive_sessions = box.space._queue_inactive_sessions
     local inactive_sessions = queue_inactive_sessions:select()
     local cur_time = util.time()
@@ -204,6 +210,14 @@ local function cfg(self, opts)
     end
 end
 
+local function exist_inactive(session_uuid)
+    if box.space._queue_inactive_sessions:get{session_uuid} then
+        return true
+    end
+
+    return false
+end
+
 queue_session.cfg = setmetatable({}, { __call = cfg })
 
 -- methods
@@ -212,7 +226,8 @@ local method = {
     disconnect = disconnect,
     grant = grant,
     on_session_remove = on_session_remove,
-    start = start
+    start = start,
+    exist_inactive = exist_inactive
 }
 
 return setmetatable(queue_session, { __index = method })

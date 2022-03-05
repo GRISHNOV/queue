@@ -4,6 +4,7 @@ local uuid     = require('uuid')
 
 local session  = require('queue.abstract.queue_session')
 local state    = require('queue.abstract.state')
+local queue_state = require('queue.abstract.queue_state')
 
 local util     = require('queue.util')
 local qc       = require('queue.compat')
@@ -36,7 +37,10 @@ local queue = {
     stat = {}
 }
 
-local function tube_release_all_tasks(tube)
+-- Release all tasks except tasks that have session_uuid
+-- stored in inactive sessions.
+-- They will be freed later in release_session_tasks().
+local function tube_release_all_orphaned_tasks(tube)
     local prefix = ('queue: [tube "%s"] '):format(tube.name)
 
     -- We lean on stable iterators in this function.
@@ -51,8 +55,17 @@ local function tube_release_all_tasks(tube)
     log.info(prefix .. 'releasing all taken task (may take a while)')
     local released = 0
     for _, task in tube.raw:tasks_by_state(state.TAKEN) do
-        tube.raw:release(task[1], {})
-        released = released + 1
+        local taken = box.space._queue_taken_2.index.task:get{
+            tube.tube_id, task[1]
+        }
+        if taken and session.exist_inactive(taken[4]) then
+            log.info(prefix ..
+                ('skipping task: %d, tube_id: %d'):format(task[1],
+                    tube.tube_id))
+        else
+            tube.raw:release(task[1], {})
+            released = released + 1
+        end
     end
     log.info(prefix .. ('released %d tasks'):format(released))
 end
@@ -72,7 +85,20 @@ end
 -- tube methods
 local tube = {}
 
+-- This check must be called from all public tube methods.
+local function check_state()
+    if queue_state.get() ~= queue_state.states.RUNNING then
+        error(('Queue is in %s state'):format(queue_state.show()))
+        return false
+    end
+
+    return true
+end
+
 function tube.put(self, data, opts)
+    if not check_state() then
+        return nil
+    end
     opts = opts or {}
     local task = self.raw:put(data, opts)
     return self.raw:normalize_task(task)
@@ -82,6 +108,9 @@ local conds = {}
 local releasing_connections = {}
 
 function tube.take(self, timeout)
+    if not check_state() then
+        return nil
+    end
     timeout = util.time(timeout or util.TIMEOUT_INFINITY)
     local task = self.raw:take()
     if task ~= nil then
@@ -120,6 +149,9 @@ function tube.take(self, timeout)
 end
 
 function tube.touch(self, id, delta)
+    if not check_state() then
+        return
+    end
     if delta == nil then
         return
     end
@@ -143,6 +175,9 @@ function tube.touch(self, id, delta)
 end
 
 function tube.ack(self, id)
+    if not check_state() then
+        return nil
+    end
     check_task_is_taken(self.tube_id, id)
     local tube = box.space._queue:get{self.name}
     local space_name = tube[3]
@@ -169,10 +204,32 @@ local function tube_release_internal(self, id, opts, session_uuid)
 end
 
 function tube.release(self, id, opts)
+    if not check_state() then
+        return nil
+    end
     return tube_release_internal(self, id, opts)
 end
 
+-- Release all tasks (force release, session_id will not be used).
+function tube.release_all(self)
+    if not check_state() then
+        return
+    end
+    local prefix = ('queue: [tube "%s"] '):format(self.name)
+
+    log.info(prefix .. 'releasing all taken task (may take a while)')
+    local released = 0
+    for _, task in self.raw:tasks_by_state(state.TAKEN) do
+        self.raw:release(task[1], {})
+        released = released + 1
+    end
+    log.info(('%s released %d tasks'):format(prefix, released))
+end
+
 function tube.peek(self, id)
+    if not check_state() then
+        return nil
+    end
     local task = self.raw:peek(id)
     if task == nil then
         error(("Task %s not found"):format(tostring(id)))
@@ -181,6 +238,9 @@ function tube.peek(self, id)
 end
 
 function tube.bury(self, id)
+    if not check_state() then
+        return nil
+    end
     local task = self:peek(id)
     local is_taken, _ = pcall(check_task_is_taken, self.tube_id, id)
     if is_taken then
@@ -193,17 +253,46 @@ function tube.bury(self, id)
 end
 
 function tube.kick(self, count)
+    if not check_state() then
+        return nil
+    end
     count = count or 1
     return self.raw:kick(count)
 end
 
+function tube._start(self)
+    if not self.raw.start then
+        log.warn('queue: [tube "%s"] method start %s is not implemented',
+            self.name)
+        return
+    end
+
+    return self.raw:start()
+end
+
+function tube._stop(self)
+    if not self.raw.stop then
+        log.warn('queue: [tube "%s"] method stop %s is not implemented',
+            self.name)
+        return
+    end
+
+    return self.raw:stop()
+end
+
 function tube.delete(self, id)
+    if not check_state() then
+        return nil
+    end
     self:peek(id)
     return self.raw:normalize_task(self.raw:delete(id))
 end
 
 -- drop tube
 function tube.drop(self)
+    if not check_state() then
+        return nil
+    end
     local tube_name = self.name
 
     local tube = box.space._queue:get{tube_name}
@@ -238,6 +327,9 @@ end
 -- truncate tube
 -- (delete everything from tube)
 function tube.truncate(self)
+    if not check_state() then
+        return
+    end
     self.raw:truncate()
 end
 
@@ -248,6 +340,9 @@ function tube.on_task_change(self, cb)
 end
 
 function tube.grant(self, user, args)
+    if not check_state() then
+        return
+    end
     local function tube_grant_space(user, name, tp)
         box.schema.user.grant(user, tp or 'read,write', 'space', name, {
             if_not_exists = true,
@@ -296,6 +391,8 @@ local required_driver_methods = {
     'bury',
     'kick',
     'peek',
+    'stop',
+    'start',
     'touch',
     'truncate',
     'tasks_by_state'
@@ -406,6 +503,10 @@ local function release_session_tasks(session_uuid)
     end
 end
 
+function method.state()
+    return queue_state.show()
+end
+
 function method._on_consumer_disconnect()
     local conn_id = connection.id()
 
@@ -449,6 +550,9 @@ end
 -------------------------------------------------------------------------------
 -- create tube
 function method.create_tube(tube_name, tube_type, opts)
+    if not check_state() then
+        return
+    end
     opts = opts or {}
     if opts.if_not_exists == nil then
         opts.if_not_exists = false
@@ -551,7 +655,7 @@ function method.start()
     if _taken == nil then
         -- tube_id, task_id, connection_id, session_uuid, time
         _taken = box.schema.create_space('_queue_taken_2', {
-            temporary = true,
+            temporary = false,
             format = {
                 {name = 'tube_id', type = num_type()},
                 {name = 'task_id', type = num_type()},
@@ -570,6 +674,12 @@ function method.start()
             parts = {4, str_type()},
             unique = false
         })
+    else
+        -- Upgrade space, queue states require that this space
+        -- was not temporary.
+        if _taken.temporary then
+            _taken:alter{temporary = false}
+        end
     end
 
     for _, tube_tuple in _queue:pairs() do
@@ -578,7 +688,7 @@ function method.start()
         if queue.driver[tube_tuple[4]] ~= nil then
             local tube = recreate_tube(tube_tuple)
             -- gh-66: release all taken tasks on start
-            tube_release_all_tasks(tube)
+            tube_release_all_orphaned_tasks(tube)
         end
     end
 
@@ -586,6 +696,7 @@ function method.start()
     session.start()
 
     connection.on_disconnect(queue._on_consumer_disconnect)
+    queue_state.init(queue.tube)
     return queue
 end
 
@@ -609,7 +720,7 @@ function method.register_driver(driver_name, tube_ctr)
         if tube_tuple[4] == driver_name then
             local tube = recreate_tube(tube_tuple)
             -- Release all task for tube on start.
-            tube_release_all_tasks(tube)
+            tube_release_all_orphaned_tasks(tube)
         end
     end
 end

@@ -1,4 +1,5 @@
 local log      = require('log')
+local ffi      = require('ffi')
 local fiber    = require('fiber')
 
 local state    = require('queue.abstract.state')
@@ -167,6 +168,16 @@ local function utubettl_fiber(self)
     while true do
         if box.info.ro == false then
             local stat, err = pcall(utubettl_fiber_iteration, self, processed)
+
+            -- Errors from tarantool has different type.
+            -- We must check it by calling ffi.istype()
+            if ffi.istype("struct error", err) then
+                if err.type == "FiberIsCancelled" then
+                    log.info("utubettl was cancelled")
+                    break
+                end
+            end
+
             if not stat and not err.code == box.error.READONLY then
                 log.error("error catched: %s", tostring(err))
                 log.error("exiting fiber '%s'", fiber.name())
@@ -390,6 +401,21 @@ end
 
 function method.truncate(self)
     self.space:truncate()
+end
+
+function method.start(self)
+    if self.fiber then
+        return
+    end
+    self.fiber = fiber.create(utubettl_fiber, self)
+end
+
+function method.stop(self)
+    if not self.fiber then
+        return
+    end
+    self.fiber:cancel()
+    self.fiber = nil
 end
 
 return tube
