@@ -42,6 +42,7 @@ align="right">
 * [Implementation details](#implementation-details)
   * [Queue drivers](#queue-drivers)
   * [Driver API](#driver-api)
+* [Queue and replication](#queue-and-replication)
 
 # Queue types
 
@@ -753,3 +754,65 @@ seconds. If queue does not support `ttr`, error will be thrown. Returns the task
 must be called only by the user who created this tube (has space ownership) OR
 under a `setuid` function. Read more about `setuid` functions
 [here](http://tarantool.org/doc/book/box/authentication.html?highlight=function#functions-and-the-func-space).
+
+# Queue and replication
+
+Queue can be used in a master-replica scheme:
+
+There are five states for queue:
+* INIT
+* STARTUP
+* RUNNING
+* ENDING
+* WAITING
+
+When the tarantool is launched for the first time,
+the state of the queue is always `INIT` until `box.info.ro` is false.
+
+States switching scheme:
+```mermaid
+stateDiagram-v2
+direction LR
+w: Waiting
+note right of w
+  monitor rw status
+end note
+s: Startup
+note left of s
+  wait for maximum
+  upstream lag * 2
+  release all tasks
+  start driver
+end note
+Init --> s
+r: Running
+note right of r
+  queue is ready
+end note
+e: Ending
+note left of e
+  stop driver
+end note
+w --> s: ro -> rw
+s --> r
+r --> e: rw -> ro
+e --> w
+```
+
+Current queue state can be shown by using `queue.state()` method.
+
+In the `STARTUP` state, the queue is waiting for possible data synchronization
+with other cluster members by the time of the largest upstream lag multiplied
+by two. After that, all taken tasks are released, except for tasks with
+session uuid matching inactive sessions uuids. This makes possible to take
+a task, switch roles on the cluster, and release the task within the timeout
+specified by the `queue.cfg({ttr = N})` parameter. Note: all clients that `take()`
+and do not `ack()/release()` tasks must be disconnected before changing the role.
+And the last step in the `STARTUP` state is starting tube driver using new
+method called `start()`.
+
+In the `RUNNING` state, the queue is working as usually. The `ENDING` state calls
+`stop()` method. in the `WAITING` state, the queue listens for a change in the
+read_only flag.
+
+All states except `INIT` is controlled by new fiber called `queue_state_fiber`.
