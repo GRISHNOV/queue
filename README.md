@@ -37,6 +37,7 @@ align="right">
   * [Kicking a number of tasks](#kicking-a-number-of-tasks)
   * [Deleting a task](#deleting-a-task)
   * [Dropping a queue](#dropping-a-queue)
+  * [Releasing all taken tasks](#releasing-all-taken-tasks)
   * [Getting statistics](#getting-statistics)
 * [Implementation details](#implementation-details)
   * [Queue drivers](#queue-drivers)
@@ -625,6 +626,14 @@ Reverse the effect of a `create` request.
 Effect: remove the tuple from the `_queue` space,
 and drop the space associated with the queue.
 
+## Releasing all taken tasks
+
+```lua
+queue.tube.tube_name:release_all()
+```
+
+Forcibly returns all taken tasks to a ready state.
+
 ## Getting statistics
 
 ```lua
@@ -707,9 +716,11 @@ Driver class must implement the following API:
     * a callback to notify the main queue framework on a task state change
   (`on_task_change`)
     * options of the queue (a Lua table)
-1. `create_space` - creates the supporting space. The arguments are:
+2. `create_space` - creates the supporting space. The arguments are:
     * space name
     * space options
+3. `start` - starts the driver fibers, if any.
+4. `stop` - stops the driver fibers, if any.
 
 To sum up, when the user creates a new queue, the queue framework
 passes the request to the driver, asking it to create a space to
