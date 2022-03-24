@@ -1,6 +1,7 @@
 #!/usr/bin/env tarantool
 
 local fio   = require('fio')
+local log   = require('log')
 local tnt   = require('t.tnt')
 local test  = require('tap').test('')
 local uuid  = require('uuid')
@@ -9,6 +10,12 @@ local fiber = require('fiber')
 
 local queue_state = require('queue.abstract.queue_state')
 rawset(_G, 'queue', require('queue'))
+
+local qc = require('queue.compat')
+if not qc.check_version({2, 4, 1}) then
+    log.info('Tests skipped, tarantool version < 2.4.1')
+    return
+end
 
 -- Replica connection handler
 local conn = {}
